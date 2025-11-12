@@ -1,0 +1,595 @@
+{
+  "name": "AI-patient-engagement",
+  "nodes": [
+    {
+      "parameters": {
+        "sink": "topic://UPDATED:org.openmrs.>",
+        "clientname": "n8n-openmrs",
+        "subscription": "updated-sub",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.amqpTrigger",
+      "typeVersion": 1,
+      "position": [
+        112,
+        160
+      ],
+      "id": "8cbdc41c-2526-4ef0-9bc3-c2521ad827a9",
+      "name": "UPDATED-Trigger",
+      "credentials": {
+        "amqp": {
+          "id": "pfFNNoQx6FzqsBWp",
+          "name": "AMQP account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "=http://192.168.1.66/openmrs{{$json.feedPath}}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "options": {
+          "allowUnauthorizedCerts": true,
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        992,
+        -208
+      ],
+      "id": "cb991d7a-2355-4e6b-ba64-17b37de79c8e",
+      "name": "HTTP Request",
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "YTCsWsCPX605vOui",
+          "name": "Openmrs account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.xml",
+      "typeVersion": 1,
+      "position": [
+        1120,
+        -32
+      ],
+      "id": "eed8db13-acd9-4cfc-88a0-c50066e747d0",
+      "name": "XML"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "\n\nconst j = $json;\nlet eventType = null;\nlet entity = null;\n\n// 1) Prefer the OpenMRS payload (most reliable)\nif (j.body?.action && j.body?.classname) {\n  eventType = String(j.body.action).toUpperCase();         // CREATED / UPDATED\n  entity    = String(j.body.classname).split('.').pop();    // Patient / Encounter / Obs / Visit / Order\n}\n\n// 2) Fallback: parse from the `to` address if needed\nconst dest = j.to || '';\nif ((!eventType || !entity) && dest) {\n  const m = String(dest).match(/topic:\\/\\/(CREATED|UPDATED):org\\.openmrs\\.([A-Za-z]+)/);\n  if (m) { eventType = m[1]; entity = m[2]; }\n}\n\nif (!eventType || !entity) {\n  return {\n    error: 'Could not parse OpenMRS event',\n    dest,\n    raw: j,\n  };\n}\n\nreturn {\n  eventType,            // e.g. \"CREATED\"\n  entity,               // e.g. \"Obs\"\n  dest,                 // e.g. \"topic://CREATED:org.openmrs.Obs\"\n  uuid: j.body?.uuid ?? null,  // handy if you want it later\n};\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        400,
+        -48
+      ],
+      "id": "727a0cf8-78b0-4ab3-928e-19040422a946",
+      "name": "OpenMrsEvent_Entity"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const entity = String($json.entity || '');\n\nlet feedPath;\n\nswitch(entity){\n  case 'Patient':\n    feedPath = '/ws/atomfeed/patient/recent';\n    break;\n  case 'Visit':\n    feedPath = '/ws/atomfeed/visit/recent';\n    break;\n  case 'Encounter':\n    feedPath = '/ws/atomfeed/encounter/recent';\n    break;\n  case 'Obs':\n    feedPath = '/ws/atomfeed/encounter/recent';\n    break;\n  case 'Order':\n    feedPath = '/ws/atomfeed/order/recent';\n    break;\n\n  default:\n    throw new Error('No atomfeed mapping for entity: ${entity}');\n    \n}\n\nreturn{\n  ...$json,\n  feedPath,\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        704,
+        -32
+      ],
+      "id": "0b7930eb-76df-4a4c-9148-e2f4836d9aa2",
+      "name": "AtomFeed_API"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Input (per item) looks like:\n// {\n//   \"feed\": { \"entry\": [ {...}, {...}, ... ] },\n//   \"uuid\": \"27fe496e-b1c5-42ce-9c16-52bb2f93245f\",\n//   ...\n// }\n//\n// Output: same data, plus:\n//   feedEntryFound: true/false\n//   feedEntry: <matched entry if found>\n//   resourceRelativeUrl: \"/openmrs/ws/rest/v1/...<uuid>...?includeAll=true\"\n//   feedEntryId, feedEntryUpdated\n\n// 1) Get UUID from the current item\nconst uuid = String($json.uuid || '').toLowerCase();\nif (!uuid) {\n  throw new Error('Missing uuid; cannot match Atomfeed entry');\n}\n\n// 2) Get entries array from feed.entry\nconst feed = $json.feed || {};\nlet entries = [];\n\nif (Array.isArray(feed.entry)) {\n  entries = feed.entry;\n} else if (feed.entry) {\n  entries = [feed.entry];\n}\n\nif (!entries.length) {\n  return {\n    ...$json,\n    feedEntryFound: false,\n    feedEntryCount: 0,\n    error: 'No entries in Atomfeed response',\n  };\n}\n\n// 3) Find entry whose content URL contains the UUID\nlet matchedEntry = null;\nlet matchedContentText = '';\n\nfor (const e of entries) {\n  let contentText = '';\n\n  // content is an object like:\n  // { \"_\": \"/openmrs/ws/rest/v1/bahmnicore/bahmniencounter/<uuid>?includeAll=true\", \"type\": \"application/vnd.atomfeed+xml\" }\n  const contentNode = e.content;\n\n  if (typeof contentNode === 'string') {\n    contentText = contentNode;\n  } else if (contentNode && typeof contentNode === 'object') {\n    contentText = contentNode._ || contentNode['#text'] || '';\n  }\n\n  if (String(contentText).toLowerCase().includes(uuid)) {\n    matchedEntry = e;\n    matchedContentText = contentText;\n    break;\n  }\n}\n\n// 4) If no match, return with a flag\nif (!matchedEntry) {\n  return {\n    ...$json,\n    feedEntryFound: false,\n    feedEntriesCount: entries.length,\n  };\n}\n\n// 5) Build resource URL from the content CDATA\nconst resourceRelativeUrl = String(matchedContentText).trim();\n\n// Optional extra info from the matched entry\nconst feedEntryId = matchedEntry.id;\nconst feedEntryUpdated = matchedEntry.updated;\n\n// 6) Merge everything into a single enriched item\nreturn {\n  ...$json,\n  feedEntryFound: true,\n  feedEntry: matchedEntry,\n  resourceRelativeUrl,\n  feedEntryId,\n  feedEntryUpdated,\n};\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1392,
+        -80
+      ],
+      "id": "d54dbd9d-b849-4c95-9518-457e6c18a8eb",
+      "name": "Event_Finder"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "71dea8e0-95a5-4b3b-a8e9-c4b9dc88f1be",
+              "name": "uuid",
+              "value": "={{ $('AtomFeed_API').item.json.uuid }}",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1184,
+        -256
+      ],
+      "id": "c97e3c2e-6e7c-463c-a851-1f9356d3997e",
+      "name": "Edit Fields"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "92baae1b-935d-40e5-8b98-1f9653acfe31",
+              "name": "uuid",
+              "value": "={{ $json.uuid }}",
+              "type": "string"
+            },
+            {
+              "id": "475f3307-6f66-4260-b114-a005808ebe6d",
+              "name": "feedEntryFound",
+              "value": "={{ $json.feedEntryFound }}",
+              "type": "boolean"
+            },
+            {
+              "id": "928ee61e-c451-45d4-a398-d129e173e84f",
+              "name": "feedEntry.title",
+              "value": "={{ $json.feedEntry.title }}",
+              "type": "string"
+            },
+            {
+              "id": "d7801a90-8a01-4371-9df9-550de5101fb6",
+              "name": "feedEntry.category",
+              "value": "={{ $json.feedEntry.category }}",
+              "type": "object"
+            },
+            {
+              "id": "3ea1c855-af23-4487-81bf-f63f1eec2151",
+              "name": "feedEntry.id",
+              "value": "={{ $json.feedEntry.id }}",
+              "type": "string"
+            },
+            {
+              "id": "7066f645-5f40-42ef-8fb6-97aff207e226",
+              "name": "feedEntry.updated",
+              "value": "={{ $json.feedEntry.updated }}",
+              "type": "string"
+            },
+            {
+              "id": "fd4805dc-8b07-4fe0-9998-2357ef84368c",
+              "name": "feedEntry.published",
+              "value": "={{ $json.feedEntry.published }}",
+              "type": "string"
+            },
+            {
+              "id": "9c8eca56-887a-42b3-ab33-64c884863708",
+              "name": "feedEntry.content",
+              "value": "={{ $json.feedEntry.content }}",
+              "type": "object"
+            },
+            {
+              "id": "9ce74a0a-0275-4284-bcd5-b6024b3af44e",
+              "name": "resourceRelativeUrl",
+              "value": "={{ $json.resourceRelativeUrl }}",
+              "type": "string"
+            },
+            {
+              "id": "3e637904-1570-4588-9526-c7487601c3b1",
+              "name": "feedEntryId",
+              "value": "={{ $json.feedEntryId }}",
+              "type": "string"
+            },
+            {
+              "id": "a1df53eb-1467-450b-bdeb-72445d8ec051",
+              "name": "feedEntryUpdated",
+              "value": "={{ $json.feedEntryUpdated }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1600,
+        0
+      ],
+      "id": "7332e124-969d-4cba-be09-37274678263c",
+      "name": "Edit Fields1"
+    },
+    {
+      "parameters": {
+        "numberInputs": 3
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        656,
+        -304
+      ],
+      "id": "f56501e7-b240-43ef-9c56-153c76a0921f",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "sink": "topic://CREATED:org.openmrs.Patient",
+        "clientname": "n8n-openmrs",
+        "subscription": "created-sub",
+        "options": {
+          "reconnect": true
+        }
+      },
+      "type": "n8n-nodes-base.amqpTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        -128
+      ],
+      "id": "b22f51ff-ae0a-4398-b1f9-4c577a56c2a8",
+      "name": "CREATED-Patient-Trigger",
+      "credentials": {
+        "amqp": {
+          "id": "pfFNNoQx6FzqsBWp",
+          "name": "AMQP account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sink": "topic://CREATED:org.openmrs.Encounter",
+        "clientname": "n8n-openmrs",
+        "subscription": "created-sub",
+        "options": {
+          "reconnect": true
+        }
+      },
+      "type": "n8n-nodes-base.amqpTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        -272
+      ],
+      "id": "08d7ea90-20d3-476f-b2d9-93ed332c5b21",
+      "name": "CREATED-Encounter-Trigger",
+      "credentials": {
+        "amqp": {
+          "id": "pfFNNoQx6FzqsBWp",
+          "name": "AMQP account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sink": "topic://CREATED:org.openmrs.Order",
+        "clientname": "n8n-openmrs",
+        "subscription": "created-sub",
+        "options": {
+          "reconnect": true
+        }
+      },
+      "type": "n8n-nodes-base.amqpTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        16
+      ],
+      "id": "824370fe-2861-4c4d-85e6-aa85d1b40d55",
+      "name": "CREATED-Order-Trigger",
+      "credentials": {
+        "amqp": {
+          "id": "pfFNNoQx6FzqsBWp",
+          "name": "AMQP account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Expects:\n//   entity: \"Encounter\" | \"Patient\" | \"Order\"\n//   uuid:   \"44b43f84-9f03-403a-bca0-d269d3e97c86\"\n\nconst entity = String($json.feedEntry.title || '').trim();\nconst uuid   = String($json.uuid || '').trim();\n\nif (!entity) {\n  throw new Error('Missing entity; cannot map to OpenMRS REST URL');\n}\n\nif (!uuid) {\n  throw new Error('Missing uuid; cannot map to OpenMRS REST URL');\n}\n\nlet restRelativeUrl;\n\nswitch (entity) {\n  case 'Encounter':\n    restRelativeUrl = `/ws/rest/v1/encounter/${uuid}?includeAll=true`;\n    break;\n\n  case 'Patient':\n    restRelativeUrl = `/ws/rest/v1/patient/${uuid}?includeAll=true`;\n    break;\n\n  case 'Order':\n    restRelativeUrl = `/ws/rest/v1/order/${uuid}?includeAll=true`;\n    break;\n\n  default:\n    throw new Error(`No REST mapping defined for entity: ${entity}`);\n}\n\n// Keep everything and add the REST URL\nreturn {\n  ...$json,\n  restRelativeUrl,\n};\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1984,
+        80
+      ],
+      "id": "b26ebffb-79f0-4e46-882d-94f5bdc47340",
+      "name": "Code"
+    },
+    {
+      "parameters": {
+        "url": "=http://192.168.1.66/openmrs{{ $json.restRelativeUrl }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "options": {
+          "allowUnauthorizedCerts": true
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2192,
+        80
+      ],
+      "id": "77195bbf-06d5-4005-92fb-6bec7839b645",
+      "name": "HTTP Request1",
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "YTCsWsCPX605vOui",
+          "name": "Openmrs account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=You are a medical assistant creating a WhatsApp message for a patient.\n\nGoal:\n- Summarize the patient's recent clinic visit in clear, friendly language.\n- Do NOT include internal IDs, UUIDs, or technical jargon.\n- Use short sentences and simple English.\n- Maximum 4–6 sentences.\n\nRules:\n- Start with a warm greeting using the patient's name if available.\n- Mention the date of the visit and the location/department if present.\n- Briefly describe the main reason or key findings (use the observations list).\n- If there is any treatment start date or severity mentioned, include it politely.\n- End with a reassuring closing and, if appropriate, a reminder to follow the doctor's advice.\n- Do NOT mention that this message was generated automatically or by a system.\n\nHere is the visit data:\n\nPatient: {{ $json.patient.display }}\nEncounter type: {{ $json.encounterType.display }}\nEncounter datetime: {{ $json.encounterDatetime }}\nLocation: {{ $json.location.display }}\nVisit: {{ $json.visit.display }}\nObservations:\n{{ ($json.obs || []).map(o => '- ' + o.display).join('\\n') }}\n",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 2.1,
+      "position": [
+        2400,
+        80
+      ],
+      "id": "14cea158-d26f-4a40-abf1-e594ef6aabf9",
+      "name": "AI Agent"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-5",
+          "mode": "list",
+          "cachedResultName": "gpt-5"
+        },
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.2,
+      "position": [
+        2272,
+        288
+      ],
+      "id": "2ee630be-c4f1-44e9-bfe7-7b437bbad854",
+      "name": "OpenAI Chat Model",
+      "credentials": {
+        "openAiApi": {
+          "id": "oop9s65rokSB6l55",
+          "name": "OpenAi account 3"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "send",
+        "phoneNumberId": "862518693611099",
+        "recipientPhoneNumber": "+12369702262",
+        "textBody": "={{ $json.output }}",
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.whatsApp",
+      "typeVersion": 1,
+      "position": [
+        2832,
+        80
+      ],
+      "id": "063421cf-1600-42a7-8b6b-32d03cf0a10a",
+      "name": "Send message",
+      "webhookId": "e1fc29f9-f478-42b0-83dc-52b059ff6bf2",
+      "credentials": {
+        "whatsAppApi": {
+          "id": "V6zgfwrKmLU6iM81",
+          "name": "WhatsApp account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "UPDATED-Trigger": {
+      "main": [
+        [
+          {
+            "node": "OpenMrsEvent_Entity",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request": {
+      "main": [
+        [
+          {
+            "node": "XML",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "XML": {
+      "main": [
+        [
+          {
+            "node": "Edit Fields",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenMrsEvent_Entity": {
+      "main": [
+        [
+          {
+            "node": "AtomFeed_API",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AtomFeed_API": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Event_Finder": {
+      "main": [
+        [
+          {
+            "node": "Edit Fields1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Edit Fields": {
+      "main": [
+        [
+          {
+            "node": "Event_Finder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "CREATED-Encounter-Trigger": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "CREATED-Patient-Trigger": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "CREATED-Order-Trigger": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "OpenMrsEvent_Entity",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Edit Fields1": {
+      "main": [
+        [
+          {
+            "node": "Code",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request1": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Send message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "f6d7b493-af67-4733-aab6-9c0c1a929e63",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "8b0b7c7455243b8a28df7702937961ecc172cc00f3328651193caf06d0db840d"
+  },
+  "id": "mc9PXkrn4aHFIAMG",
+  "tags": []
+}
